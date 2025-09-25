@@ -1,0 +1,20 @@
+# Core dashboard framework
+streamlit==1.38.0
+
+# Data handling
+pandas==2.2.2
+numpy==1.26.4
+
+# Mapping
+folium==0.17.0
+streamlit-folium==0.18.0
+
+# Visualization
+plotly==5.22.0
+
+# Utilities
+python-dateutil==2.9.0.post0
+pytz==2024.1
+
+# Optional - to prevent warnings with CSVs
+openpyxl==3.1.2
