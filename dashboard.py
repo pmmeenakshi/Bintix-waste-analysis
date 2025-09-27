@@ -540,7 +540,12 @@ with tab_map:
 
         lat0 = float(valid["Lat"].mean())
         lon0 = float(valid["Lon"].mean())
-        fmap = folium.Map(location=[lat0, lon0], zoom_start=11, tiles="cartodbpositron")
+        fmap = folium.Map(
+            location=[lat0, lon0],
+            zoom_start=11,
+            tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+            attr="© OpenStreetMap, © CARTO",
+        )
 
         # Cluster all markers (keeps performance while showing everything)
         cluster = MarkerCluster().add_to(fmap)
@@ -565,42 +570,39 @@ with tab_map:
             # Use image-based charts (safe for Folium popups)
             # Only render popup charts if the toggle is ON (much faster when OFF)
             bar_img = donut_img = ""
-            if show_popup_charts:
-                try:
-                    bar_img, donut_img = popup_charts_for_comm(dfl_filt, comm)
-                except Exception:
-                    bar_img, donut_img = "", ""
+        
             popup_html = f"""
             <div style='font-family:Poppins; width:360px;'>
-                <h4 style='margin:0 0 4px 0; color:#36204D;'>{comm}</h4>
-                <div style='font-size:12px; color:#333;'>City: {city} | Pincode: {pin}</div>
-                <hr style='margin:6px 0;'>
-
-                <div style='display:flex; align-items:center; margin-bottom:6px;'>
-                    <img src="{TREE_ICON}" width="18">
-                    <span style='margin-left:8px;'><b>{stats['trees']:,.0f} Trees Saved</b></span>
-                </div>
-                <div style='display:flex; align-items:center; margin-bottom:6px;'>
-                    <img src="{HOUSE_ICON}" width="18">
-                    <span style='margin-left:8px;'><b>{stats['households']:,.0f} Households Participating</b></span>
-                </div>
-                <div style='display:flex; align-items:center; margin-bottom:6px;'>
-                    <img src="{RECYCLE_ICON}" width="18">
-                    <span style='margin-left:8px;'><b>{stats['seg_pct']:.1f}% Segregation</b></span>
-                </div>
-
-                <hr style='margin:8px 0;'>
-                <div style='margin-bottom:8px;'>
-                    <b>CO₂ Averted</b>
-                    {donut_img}
-                </div>
-
-                <div style='margin-top:6px;'>
-                    <b>Tonnage</b>
-                    {bar_img}
-                </div>
+              <h4 style='margin:0 0 4px 0; color:#36204D;'>{comm}</h4>
+              <div style='font-size:12px; color:#333;'>City: {city} | Pincode: {pin}</div>
+              <hr style='margin:6px 0;'>
+            
+              <div style='display:flex; align-items:center; margin-bottom:6px;'>
+                <img src="{TREE_ICON}" width="18">
+                <span style='margin-left:8px;'><b>{stats['trees']:,.0f} Trees Saved</b></span>
+              </div>
+            
+              <div style='display:flex; align-items:center; margin-bottom:6px;'>
+                <img src="{HOUSE_ICON}" width="18">
+                <span style='margin-left:8px;'><b>{stats['hh']:,.0f} Households Participating</b></span>
+              </div>
+            
+              <div style='display:flex; align-items:center; margin-bottom:6px;'>
+                <img src="{RECYCLE_ICON}" width="18">
+                <span style='margin-left:8px;'><b>{stats['seg']:.1f}% Segregation</b></span>
+              </div>
+            
+              <div style='display:flex; align-items:center; margin-bottom:6px;'>
+                <span><b>CO₂ Averted (kg):</b> {stats['co2_calc']:,.0f}</span>
+              </div>
+            
+              <div style='display:flex; align-items:center;'>
+                <span><b>Tonnage (kg):</b> {stats['ton_sum']:,.0f}</span>
+              </div>
             </div>
             """
+
+          
 
         
             folium.CircleMarker(
@@ -616,12 +618,15 @@ with tab_map:
 
         # Render map
         st.markdown("##### Map")
-        map_event = st_folium(
+            map_event = st_folium(
             fmap,
             height=ST_MAP_HEIGHT,
             use_container_width=True,
-            returned_objects=ST_RETURNED_OBJECTS  # don't return all markers to Streamlit
+            returned_objects=[],              # do not send heavy objects to Streamlit
+            key="main_leaflet_map_v1",        # stable key prevents remounts
         )
+
+       
 
         # Capture selection
         selected_comm, selected_pin = None, None
@@ -954,4 +959,5 @@ with tab_insights:
         key="dl_trends_bottom",  # unique key avoids duplicate-id errors
     )
     st.dataframe(dfl_filt, use_container_width=True, height=420)
+
 
