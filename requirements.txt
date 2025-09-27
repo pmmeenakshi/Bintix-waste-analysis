@@ -2,7 +2,7 @@ streamlit==1.38.0
 pandas
 numpy
 folium
-streamlit-folium
+streamlit-folium==0.20.0
 plotly
 matplotlib
-
+kaleido
