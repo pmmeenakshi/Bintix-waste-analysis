@@ -10,30 +10,34 @@ from pathlib import Path
 import base64, mimetypes
 
 # === ASSETS: load icons as data URIs and tolerate both folder spellings ===
-  # safe, we already set page_config
+
 
 BASE_DIR = Path(__file__).parent.resolve()
+# Try both spellings so it works whether the folder is "assets" or "assests"
+_ASSET_DIR_CANDIDATES = [BASE_DIR / "assets", BASE_DIR / "assests"]
+ASSETS_DIR = next((p for p in _ASSET_DIR_CANDIDATES if p.exists()), _ASSET_DIR_CANDIDATES[0])
 
-# Look in repo root first (your case), then assets/, then assests/
-_ASSET_DIR_CANDIDATES = [BASE_DIR, BASE_DIR / "assets", BASE_DIR / "assests"]
-ASSETS_DIR = next((p for p in _ASSET_DIR_CANDIDATES if p.exists()), BASE_DIR)
-
+@st.cache_resource(show_spinner=False)
 def load_icon_data_uri(filename: str) -> str:
-    """Return data: URI for an image; empty string if missing (so popup still renders)."""
+    """Return a data: URI for an image in ASSETS_DIR so it renders inside Folium popups."""
     p = ASSETS_DIR / filename
     if not p.exists():
-        return ""
+        raise FileNotFoundError(f"Icon not found: {p}")
     mime = mimetypes.guess_type(p.name)[0] or "image/png"
     b64 = base64.b64encode(p.read_bytes()).decode("ascii")
     return f"data:{mime};base64,{b64}"
 
-# your files are at repo root: tree.png, house.png, waste-management.png
-TREE_ICON    = load_icon_data_uri("tree.png")
-HOUSE_ICON   = load_icon_data_uri("house.png")
-RECYCLE_ICON = load_icon_data_uri("waste-management.png")
+# Load once and reuse
+try:
+    TREE_ICON     = load_icon_data_uri("tree.png")
+    HOUSE_ICON    = load_icon_data_uri("house.png")
+    RECYCLE_ICON  = load_icon_data_uri("waste-management.png")
+except FileNotFoundError as e:
+    st.error(f"{e}\nMake sure your icons are in: {ASSETS_DIR}")
+    # safe fallbacks so the rest of the app still runs
+    TREE_ICON = HOUSE_ICON = RECYCLE_ICON = ""
 
-if not all([TREE_ICON, HOUSE_ICON, RECYCLE_ICON]):
-    st.warning(f"Some icons not found in: {ASSETS_DIR}. Popups will show text without icons.")
+
 
 # fixed file path relative to this script
 BASE_DIR = Path(__file__).parent
@@ -92,6 +96,7 @@ try:
 except Exception as e:
     st.error(f"Error loading dataset: {e}")
     st.stop()
+    
 
    
 # === BLOCK 2: Final UI + Map + Selection at Bottom + Brand Styling ===
@@ -343,21 +348,31 @@ def small_trend_base64(df_long_filtered, community_id, metric):
 
 
 # --- Community summary using filtered frame ---
-def summarize_for_community(community_id=None, pincode=None):
-    d = dfl_filt.copy()  # already filtered by date slider
-    if "Community" in d: d["Community"] = d["Community"].astype(str)
-    if "Pincode"   in d: d["Pincode"]   = d["Pincode"].astype(str)
-    if community_id is not None:
-        d = d[d["Community"] == str(community_id)]
+# ---- DATE-RANGE AWARE POPUP SUMMARY ----
+@st.cache_data(show_spinner=False)
+# ---- DATE-RANGE AWARE POPUP SUMMARY ----
+@st.cache_data(show_spinner=False)
+def summarize_for_popup(dfl_filtered: pd.DataFrame, community_id: str, pincode: str|None):
+    """
+    Returns all popup KPIs based ONLY on current date-filtered data.
+    Keys returned: tonnage, co2, households, seg_pct, trees
+    """
+    d = dfl_filtered.copy()
+    d["Community"] = d["Community"].astype(str)
+    if pincode is not None and "Pincode" in d.columns:
+        d["Pincode"] = d["Pincode"].astype(str)
+
+    d = d[d["Community"] == str(community_id)]
     if pincode is not None:
         d = d[d["Pincode"] == str(pincode)]
 
-    def agg(metric, how="sum"):
+    def agg(metric: str, how="sum") -> float:
         s = d.loc[d["Metric"] == metric, "Value"]
-        if s.empty: return 0.0
-        return float(s.sum() if how=="sum" else s.mean())
+        if s.empty:
+            return 0.0
+        return float(s.sum() if how == "sum" else s.mean())
 
-    # Prefer a dedicated dry-waste metric; fallback to total tonnage
+    # Prefer dry waste if present
     dry_candidates = ["Tonnage_Dry", "Dry_Tonnage", "DryWaste", "Tonnage"]
     dry_kg = 0.0
     for m in dry_candidates:
@@ -366,23 +381,18 @@ def summarize_for_community(community_id=None, pincode=None):
             dry_kg = float(s.sum())
             break
 
-    # If your Tonnage was stored in tonnes (not kg), uncomment the next line:
-    # dry_kg *= 1000.0
-
-    co2_calc   = dry_kg * CO2_PER_KG_DRY
-    trees      = dry_kg / KG_PER_TREE
+    co2 = dry_kg * CO2_PER_KG_DRY
+    trees = dry_kg / KG_PER_TREE
 
     return {
-        "Tonnage_sum": agg("Tonnage", "sum"),
-        "CO2_sum": agg("CO2_Kgs_Averted", "sum"),  # if present in data
-        "HH_sum": agg("Households_Participating", "sum"),
-        "Seg_pct_avg": agg("Segregation_Compliance_Pct", "mean"),
-        "Impact_avg": agg("Impact", "mean"),
-        # new
-        "Dry_kg": dry_kg,
-        "CO2_calc": co2_calc,
-        "Trees_saved": trees,
+        "tonnage":    agg("Tonnage", "sum"),
+        "co2":        co2,
+        "households": agg("Households_Participating", "sum"),
+        "seg_pct":    agg("Segregation_Compliance_Pct", "mean"),
+        "trees":      trees,
     }
+
+
 import plotly.express as px
 import plotly.io as pio
 import numpy as np
@@ -428,75 +438,58 @@ def _distinct_colors(n):
     return colors[:n]
 @st.cache_data(show_spinner=False)
 
-def popup_charts_for_comm(dfl_filtered, community_id):
+def popup_charts_for_comm(dfl_filtered: pd.DataFrame, community_id: str):
     """
-    Charts for the *current date range* (dfl_filtered is already slider-filtered):
-      - BAR (brand purple): Tonnage by month across the selected range
-      - DONUT (distinct colors): CO2 averted by month across the selected range
-    Returns (bar_img_html, donut_img_html) as <img> tags (base64 PNG).
+    Cached chart generator for popup.
+    Uses date-filtered data (dfl_filtered) for speed and accuracy.
     """
     BRAND = BRAND_PRIMARY
-
     dm = dfl_filtered.copy()
     dm["Community"] = dm["Community"].astype(str)
     dm = dm[dm["Community"] == str(community_id)]
     if dm.empty:
         return "", ""
 
-    # --- month key that preserves chronological order across years ---
-    dm["MonthKey"] = dm["Date"].dt.to_period("M")  # e.g., 2024-04, 2024-05, ...
-    month_order = (dm["MonthKey"].drop_duplicates().sort_values().tolist())
-    month_labels = [p.to_timestamp().strftime("%b") for p in month_order]  # Apr, May, ...
+    dm["MonthKey"] = dm["Date"].dt.to_period("M")
 
-    # ---------- TONNAGE BAR: all months in selected range ----------
+    # --- TONNAGE: now LINE chart (lighter to render than bars)
     bar_img = ""
-    d_ton = dm[dm["Metric"] == "Tonnage"][["MonthKey", "Value"]].copy()
+    d_ton = dm[dm["Metric"] == "Tonnage"][["MonthKey", "Value"]]
     if not d_ton.empty:
-        d_ton = (d_ton.groupby("MonthKey", as_index=False)["Value"].sum()
-                        .sort_values("MonthKey"))
-        # label column in same order as month_order
-        d_ton["Month"] = [p.to_timestamp().strftime("%b") for p in d_ton["MonthKey"]]
-
-        fig, ax = plt.subplots(figsize=(3.2, 1.8))
-        ax.bar(d_ton["Month"], d_ton["Value"], color=BRAND)
+        d_ton = d_ton.groupby("MonthKey", as_index=False)["Value"].sum().sort_values("MonthKey")
+        xlab = [p.to_timestamp().strftime("%b") for p in d_ton["MonthKey"]]
+        fig, ax = plt.subplots(figsize=(3.1, 1.6), dpi=120)
+        ax.plot(xlab, d_ton["Value"], marker="o", lw=1.6, color=BRAND)
         ax.set_title("Tonnage", fontsize=9, color=BRAND, pad=2)
-        ax.tick_params(axis="x", labelsize=8, colors=BRAND, rotation=0)
+        ax.tick_params(axis="x", labelsize=8, colors=BRAND)
         ax.tick_params(axis="y", labelsize=8, colors=BRAND)
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f"{int(x):,}"))
-        for spine in ax.spines.values(): spine.set_visible(False)
-        ax.grid(alpha=0.15, axis="y")
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{int(v):,}"))
+        for s in ax.spines.values():
+            s.set_visible(False)
+        ax.grid(alpha=0.12, axis="y")
         bar_img = _to_data_uri(fig, w=300)
 
-    # ---------- CO2 DONUT: all months in selected range ----------
+    # --- CO₂ DONUT
     donut_img = ""
-    # Use dry tonnage if exists; otherwise fallback to Tonnage
     dry_candidates = ["Tonnage_Dry", "Dry_Tonnage", "DryWaste", "Tonnage"]
     dry_month = None
     for m in dry_candidates:
-        cur = dm[dm["Metric"] == m][["MonthKey", "Value"]].copy()
+        cur = dm[dm["Metric"] == m][["MonthKey", "Value"]]
         if not cur.empty:
             dry_month = cur
             break
-
-    if dry_month is not None and not dry_month.empty:
-        d = (dry_month.groupby("MonthKey", as_index=False)["Value"].sum()
-                        .sort_values("MonthKey"))
+    if dry_month is not None:
+        d = dry_month.groupby("MonthKey", as_index=False)["Value"].sum().sort_values("MonthKey")
         vals = (d["Value"] * CO2_PER_KG_DRY).clip(lower=0.0).to_numpy()
         labels = [p.to_timestamp().strftime("%b") for p in d["MonthKey"]]
-        colors = _distinct_colors(len(labels))  # one distinct color per month
+        colors = _distinct_colors(len(labels))
 
-        fig, ax = plt.subplots(figsize=(2.4, 2.4))
-        wedges, _ = ax.pie(
-            vals,
-            wedgeprops=dict(width=0.45),
-            startangle=90,
-            colors=colors
-        )
+        fig, ax = plt.subplots(figsize=(2.3, 2.3), dpi=120)
+        wedges, _ = ax.pie(vals, wedgeprops=dict(width=0.45), startangle=90, colors=colors)
         ax.set(aspect="equal")
         ax.text(0, 0, "CO₂\nAverted", ha="center", va="center",
                 fontsize=9, color=BRAND, fontweight="bold", linespacing=1.1)
-        # legend on the right with month labels
-        ax.legend(wedges, labels, loc="center left", bbox_to_anchor=(1.02, 0.5),
+        ax.legend(wedges, labels, loc="center left", bbox_to_anchor=(1.0, 0.5),
                   fontsize=8, frameon=False)
         donut_img = _to_data_uri(fig, w=220)
 
@@ -563,7 +556,8 @@ with tab_map:
 
         # Loop once
         for comm, pin, lat, lon, city in zip(comm_arr, pin_arr, lat_arr, lon_arr, city_arr):
-            stats = summarize_for_community(community_id=comm, pincode=pin)
+           
+            stats = summarize_for_popup(dfl_filt, community_id=comm, pincode=pin)
 
             # >>> THIS IS THE REPLACED POPUP CONTENT <<<
             # Use image-based charts (safe for Folium popups)
@@ -572,7 +566,6 @@ with tab_map:
                 bar_img, donut_img = popup_charts_for_comm(dfl_filt, comm)
             except Exception as e:
                 bar_img, donut_img = "", ""   # fail safe so the map still renders
-
             popup_html = f"""
             <div style='font-family:Poppins; width:360px;'>
                 <h4 style='margin:0 0 4px 0; color:#36204D;'>{comm}</h4>
@@ -581,15 +574,15 @@ with tab_map:
 
                 <div style='display:flex; align-items:center; margin-bottom:6px;'>
                     <img src="{TREE_ICON}" width="18">
-                    <span style='margin-left:8px;'><b>{stats['Trees_saved']:,.0f} Trees Saved</b></span>
+                    <span style='margin-left:8px;'><b>{stats['trees']:,.0f} Trees Saved</b></span>
                 </div>
                 <div style='display:flex; align-items:center; margin-bottom:6px;'>
                     <img src="{HOUSE_ICON}" width="18">
-                    <span style='margin-left:8px;'><b>{stats['HH_sum']:,.0f} Households Participating</b></span>
+                    <span style='margin-left:8px;'><b>{stats['households']:,.0f} Households Participating</b></span>
                 </div>
                 <div style='display:flex; align-items:center; margin-bottom:6px;'>
                     <img src="{RECYCLE_ICON}" width="18">
-                    <span style='margin-left:8px;'><b>{stats['Seg_pct_avg']:.1f}% Segregation</b></span>
+                    <span style='margin-left:8px;'><b>{stats['seg_pct']:.1f}% Segregation</b></span>
                 </div>
 
                 <hr style='margin:8px 0;'>
@@ -668,11 +661,13 @@ else:
 
     # --- KPIs (CO2 from formula) ---
     cA, cB, cC, cD = st.columns(4)
-    stats = summarize_for_community(community_id=selected_comm, pincode=selected_pin)
-    cA.metric("Tonnage (kg)", f"{stats['Tonnage_sum']:,.0f}")
-    cB.metric("CO₂ Averted (kg)", f"{stats['CO2_calc']:,.0f}")  # ← formula-based
-    cC.metric("Households", f"{stats['HH_sum']:,.0f}")
-    cD.metric("Segregation % (avg)", f"{stats['Seg_pct_avg']:.1f}")
+    
+    stats = summarize_for_popup(dfl_filt, community_id=selected_comm, pincode=selected_pin)
+
+    cA.metric("Tonnage (kg)", f"{stats['tonnage']:,.0f}")
+    cB.metric("CO₂ Averted (kg)", f"{stats['co2']:,.0f}")
+    cC.metric("Households", f"{stats['households']:,.0f}")
+    cD.metric("Segregation % (avg)", f"{stats['seg_pct']:.1f}")
 
     # --- Trends (brand color #36204D) ---
     st.markdown("#### Trends (Selected Community)")
@@ -969,5 +964,4 @@ with tab_insights:
         key="dl_trends_bottom",  # unique key avoids duplicate-id errors
     )
     st.dataframe(dfl_filt, use_container_width=True, height=420)
-
 
