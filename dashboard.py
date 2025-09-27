@@ -10,34 +10,30 @@ from pathlib import Path
 import base64, mimetypes
 
 # === ASSETS: load icons as data URIs and tolerate both folder spellings ===
-
+  # safe, we already set page_config
 
 BASE_DIR = Path(__file__).parent.resolve()
-# Try both spellings so it works whether the folder is "assets" or "assests"
-_ASSET_DIR_CANDIDATES = [BASE_DIR / "assets", BASE_DIR / "assests"]
-ASSETS_DIR = next((p for p in _ASSET_DIR_CANDIDATES if p.exists()), _ASSET_DIR_CANDIDATES[0])
 
-@st.cache_resource(show_spinner=False)
+# Look in repo root first (your case), then assets/, then assests/
+_ASSET_DIR_CANDIDATES = [BASE_DIR, BASE_DIR / "assets", BASE_DIR / "assests"]
+ASSETS_DIR = next((p for p in _ASSET_DIR_CANDIDATES if p.exists()), BASE_DIR)
+
 def load_icon_data_uri(filename: str) -> str:
-    """Return a data: URI for an image in ASSETS_DIR so it renders inside Folium popups."""
+    """Return data: URI for an image; empty string if missing (so popup still renders)."""
     p = ASSETS_DIR / filename
     if not p.exists():
-        raise FileNotFoundError(f"Icon not found: {p}")
+        return ""
     mime = mimetypes.guess_type(p.name)[0] or "image/png"
     b64 = base64.b64encode(p.read_bytes()).decode("ascii")
     return f"data:{mime};base64,{b64}"
 
-# Load once and reuse
-try:
-    TREE_ICON     = load_icon_data_uri("tree.png")
-    HOUSE_ICON    = load_icon_data_uri("house.png")
-    RECYCLE_ICON  = load_icon_data_uri("waste-management.png")
-except FileNotFoundError as e:
-    st.error(f"{e}\nMake sure your icons are in: {ASSETS_DIR}")
-    # safe fallbacks so the rest of the app still runs
-    TREE_ICON = HOUSE_ICON = RECYCLE_ICON = ""
+# your files are at repo root: tree.png, house.png, waste-management.png
+TREE_ICON    = load_icon_data_uri("tree.png")
+HOUSE_ICON   = load_icon_data_uri("house.png")
+RECYCLE_ICON = load_icon_data_uri("waste-management.png")
 
-
+if not all([TREE_ICON, HOUSE_ICON, RECYCLE_ICON]):
+    st.warning(f"Some icons not found in: {ASSETS_DIR}. Popups will show text without icons.")
 
 # fixed file path relative to this script
 BASE_DIR = Path(__file__).parent
@@ -973,4 +969,5 @@ with tab_insights:
         key="dl_trends_bottom",  # unique key avoids duplicate-id errors
     )
     st.dataframe(dfl_filt, use_container_width=True, height=420)
+
 
