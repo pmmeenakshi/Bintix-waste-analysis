@@ -4,6 +4,41 @@ import pandas as pd
 import streamlit as st
 from pathlib import Path
 
+
+
+from pathlib import Path
+import base64, mimetypes
+
+# === ASSETS: load icons as data URIs and tolerate both folder spellings ===
+
+
+BASE_DIR = Path(__file__).parent.resolve()
+# Try both spellings so it works whether the folder is "assets" or "assests"
+_ASSET_DIR_CANDIDATES = [BASE_DIR / "assets", BASE_DIR / "assests"]
+ASSETS_DIR = next((p for p in _ASSET_DIR_CANDIDATES if p.exists()), _ASSET_DIR_CANDIDATES[0])
+
+@st.cache_resource(show_spinner=False)
+def load_icon_data_uri(filename: str) -> str:
+    """Return a data: URI for an image in ASSETS_DIR so it renders inside Folium popups."""
+    p = ASSETS_DIR / filename
+    if not p.exists():
+        raise FileNotFoundError(f"Icon not found: {p}")
+    mime = mimetypes.guess_type(p.name)[0] or "image/png"
+    b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+# Load once and reuse
+try:
+    TREE_ICON     = load_icon_data_uri("tree.png")
+    HOUSE_ICON    = load_icon_data_uri("house.png")
+    RECYCLE_ICON  = load_icon_data_uri("waste-management.png")
+except FileNotFoundError as e:
+    st.error(f"{e}\nMake sure your icons are in: {ASSETS_DIR}")
+    # safe fallbacks so the rest of the app still runs
+    TREE_ICON = HOUSE_ICON = RECYCLE_ICON = ""
+
+
+
 # fixed file path relative to this script
 BASE_DIR = Path(__file__).parent
 CSV_DEFAULT = BASE_DIR / "standardized_wide_fy2024_25.csv"
@@ -64,6 +99,7 @@ except Exception as e:
 
    
 # === BLOCK 2: Final UI + Map + Selection at Bottom + Brand Styling ===
+import io, base64
 from pathlib import Path
 import time
 import pandas as pd
@@ -72,6 +108,11 @@ import streamlit as st
 from streamlit_folium import st_folium
 import folium
 import plotly.express as px
+from folium.plugins import MarkerCluster
+
+# Speed settings
+ST_MAP_HEIGHT = 560
+ST_RETURNED_OBJECTS = []  # don't send all map layers back to Streamlit
 
 # ---------------- Theme and Layout ----------------
 st.set_page_config(page_title="Bintix Waste Analytics", layout="wide")
@@ -80,6 +121,10 @@ BRAND_PRIMARY = "#36204D"     # purple
 SECONDARY_GREEN = "#2E7D32"   # (kept only if you need elsewhere; not used on map)
 TEXT_DARK = "#36204D"         # brand purple for all body text
        # readable gray on white
+
+# --- Environmental conversions ---
+CO2_PER_KG_DRY = 2.18      # 1 kg dry waste -> 2.18 kg CO2 averted
+KG_PER_TREE     = 117.0     # 117 kg dry waste -> 1 tree saved
 st.markdown(
     """
     <style>
@@ -278,11 +323,32 @@ def small_trend(df_long_or_filtered, community_id, metric):
                       marker=dict(color="#36204D"))
     return fig
 
+def _fig_to_base64_png(fig, w=420, h=180, scale=2):
+    """
+    Render a Plotly fig to PNG and return base64 string.
+    Requires `kaleido` in requirements.txt.
+    """
+    fig.update_layout(width=w, height=h)
+    png = fig.to_image(format="png", width=w, height=h, scale=scale)  # needs kaleido
+    return base64.b64encode(png).decode("utf-8")
+
+
+def small_trend_base64(df_long_filtered, community_id, metric):
+    """
+    Make your brand-styled sparkline (purple) and return <img> tag (base64 PNG).
+    """
+    fig = small_trend(df_long_filtered, community_id, metric)
+    if fig is None:
+        return ""
+    b64 = _fig_to_base64_png(fig, w=420, h=180, scale=2)
+    return f"<img src='data:image/png;base64,{b64}' style='width:100%;border:1px solid #eee;border-radius:8px'/>"
+
+
 
 
 # --- Community summary using filtered frame ---
 def summarize_for_community(community_id=None, pincode=None):
-    d = dfl_filt.copy()
+    d = dfl_filt.copy()  # already filtered by date slider
     if "Community" in d: d["Community"] = d["Community"].astype(str)
     if "Pincode"   in d: d["Pincode"]   = d["Pincode"].astype(str)
     if community_id is not None:
@@ -295,17 +361,176 @@ def summarize_for_community(community_id=None, pincode=None):
         if s.empty: return 0.0
         return float(s.sum() if how=="sum" else s.mean())
 
+    # Prefer a dedicated dry-waste metric; fallback to total tonnage
+    dry_candidates = ["Tonnage_Dry", "Dry_Tonnage", "DryWaste", "Tonnage"]
+    dry_kg = 0.0
+    for m in dry_candidates:
+        s = d.loc[d["Metric"] == m, "Value"]
+        if not s.empty:
+            dry_kg = float(s.sum())
+            break
+
+    # If your Tonnage was stored in tonnes (not kg), uncomment the next line:
+    # dry_kg *= 1000.0
+
+    co2_calc   = dry_kg * CO2_PER_KG_DRY
+    trees      = dry_kg / KG_PER_TREE
+
     return {
         "Tonnage_sum": agg("Tonnage", "sum"),
-        "CO2_sum": agg("CO2_Kgs_Averted", "sum"),
+        "CO2_sum": agg("CO2_Kgs_Averted", "sum"),  # if present in data
         "HH_sum": agg("Households_Participating", "sum"),
         "Seg_pct_avg": agg("Segregation_Compliance_Pct", "mean"),
         "Impact_avg": agg("Impact", "mean"),
+        # new
+        "Dry_kg": dry_kg,
+        "CO2_calc": co2_calc,
+        "Trees_saved": trees,
     }
+import plotly.express as px
+import plotly.io as pio
+import numpy as np
+
+
+
+
+@st.cache_data(show_spinner=False)
+def monthly_series(df_long, community: str, metric: str):
+    d = df_long[
+        (df_long["Community"].astype(str) == str(community)) &
+        (df_long["Metric"] == metric)
+    ][["Date", "Value"]].sort_values("Date").copy()
+    return d
+
+# --- image helpers for popup cards ---
+import io, base64, matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+
+def _to_data_uri(fig, w=340):  # return an <img> HTML tag from a Matplotlib fig
+    buf = io.BytesIO()
+    plt.tight_layout(pad=0.3)
+    fig.savefig(buf, format="png", bbox_inches="tight", transparent=True, dpi=180)
+    plt.close(fig)
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"<img src='data:image/png;base64,{b64}' style='width:{w}px;height:auto;border:0;'/>"
+
+# helper for distinct colors (enough for 12+ months)
+def _distinct_colors(n):
+    import matplotlib.pyplot as plt
+    # tab20 is good up to 20; extend with Set3 then Pastel1 if ever needed
+    cmaps = [plt.cm.tab20, plt.cm.Set3, plt.cm.Pastel1]
+    colors = []
+    i = 0
+    while len(colors) < n:
+        cmap = cmaps[i % len(cmaps)]
+        M = cmap.N
+        take = min(n - len(colors), M)
+        # sample evenly across the colormap
+        for j in range(take):
+            colors.append(cmap(j / max(M - 1, 1)))
+        i += 1
+    return colors[:n]
+@st.cache_data(show_spinner=False)
+
+def popup_charts_for_comm(dfl_filtered, community_id):
+    """
+    Charts for the *current date range* (dfl_filtered is already slider-filtered):
+      - BAR (brand purple): Tonnage by month across the selected range
+      - DONUT (distinct colors): CO2 averted by month across the selected range
+    Returns (bar_img_html, donut_img_html) as <img> tags (base64 PNG).
+    """
+    BRAND = BRAND_PRIMARY
+
+    dm = dfl_filtered.copy()
+    dm["Community"] = dm["Community"].astype(str)
+    dm = dm[dm["Community"] == str(community_id)]
+    if dm.empty:
+        return "", ""
+
+    # --- month key that preserves chronological order across years ---
+    dm["MonthKey"] = dm["Date"].dt.to_period("M")  # e.g., 2024-04, 2024-05, ...
+    month_order = (dm["MonthKey"].drop_duplicates().sort_values().tolist())
+    month_labels = [p.to_timestamp().strftime("%b") for p in month_order]  # Apr, May, ...
+
+    # ---------- TONNAGE BAR: all months in selected range ----------
+    bar_img = ""
+    d_ton = dm[dm["Metric"] == "Tonnage"][["MonthKey", "Value"]].copy()
+    if not d_ton.empty:
+        d_ton = (d_ton.groupby("MonthKey", as_index=False)["Value"].sum()
+                        .sort_values("MonthKey"))
+        # label column in same order as month_order
+        d_ton["Month"] = [p.to_timestamp().strftime("%b") for p in d_ton["MonthKey"]]
+
+        fig, ax = plt.subplots(figsize=(3.2, 1.8))
+        ax.bar(d_ton["Month"], d_ton["Value"], color=BRAND)
+        ax.set_title("Tonnage", fontsize=9, color=BRAND, pad=2)
+        ax.tick_params(axis="x", labelsize=8, colors=BRAND, rotation=0)
+        ax.tick_params(axis="y", labelsize=8, colors=BRAND)
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f"{int(x):,}"))
+        for spine in ax.spines.values(): spine.set_visible(False)
+        ax.grid(alpha=0.15, axis="y")
+        bar_img = _to_data_uri(fig, w=300)
+
+    # ---------- CO2 DONUT: all months in selected range ----------
+    donut_img = ""
+    # Use dry tonnage if exists; otherwise fallback to Tonnage
+    dry_candidates = ["Tonnage_Dry", "Dry_Tonnage", "DryWaste", "Tonnage"]
+    dry_month = None
+    for m in dry_candidates:
+        cur = dm[dm["Metric"] == m][["MonthKey", "Value"]].copy()
+        if not cur.empty:
+            dry_month = cur
+            break
+
+    if dry_month is not None and not dry_month.empty:
+        d = (dry_month.groupby("MonthKey", as_index=False)["Value"].sum()
+                        .sort_values("MonthKey"))
+        vals = (d["Value"] * CO2_PER_KG_DRY).clip(lower=0.0).to_numpy()
+        labels = [p.to_timestamp().strftime("%b") for p in d["MonthKey"]]
+        colors = _distinct_colors(len(labels))  # one distinct color per month
+
+        fig, ax = plt.subplots(figsize=(2.4, 2.4))
+        wedges, _ = ax.pie(
+            vals,
+            wedgeprops=dict(width=0.45),
+            startangle=90,
+            colors=colors
+        )
+        ax.set(aspect="equal")
+        ax.text(0, 0, "CO₂\nAverted", ha="center", va="center",
+                fontsize=9, color=BRAND, fontweight="bold", linespacing=1.1)
+        # legend on the right with month labels
+        ax.legend(wedges, labels, loc="center left", bbox_to_anchor=(1.02, 0.5),
+                  fontsize=8, frameon=False)
+        donut_img = _to_data_uri(fig, w=220)
+
+    return bar_img, donut_img
+
+
+import numpy as np
+  # keep this near your other imports
+
+def jitter_duplicates(df, lat_col="Lat", lon_col="Lon", jitter_deg=0.00025):
+    """
+    Move markers that share the same (Lat, Lon) into a tiny circle around
+    the original location so each one gets a working tooltip/popup.
+    jitter_deg ~ 0.00025 ≈ 25–30 meters.
+    """
+    df = df.copy()
+    # bucket by rounded coords so "almost equal" also spreads
+    gb = df.groupby([df[lat_col].round(6), df[lon_col].round(6)])
+
+    for _, idx in gb.groups.items():                 # <— idx is an Index of rows in this bucket
+        n = len(idx)
+        if n > 1:
+            angles = np.linspace(0, 2*np.pi, n, endpoint=False)
+            r = jitter_deg
+            df.loc[idx, lat_col] = df.loc[idx, lat_col].to_numpy() + r * np.sin(angles)
+            df.loc[idx, lon_col] = df.loc[idx, lon_col].to_numpy() + r * np.cos(angles)
+    return df
 
 # ---------------- Map Tab ----------------
 with tab_map:
-    # Build map (full width)
     has_latlon = (
         "Lat" in dfw_filt.columns and "Lon" in dfw_filt.columns and
         dfw_filt[["Lat","Lon"]].notna().all(axis=1).any()
@@ -315,43 +540,97 @@ with tab_map:
         st.warning("Map needs coordinates. Add **Lat/Lon** columns or merge a `pincode_centroids.csv`.")
         st.info("Click markers to see details here (after coordinates are available).")
         selected_comm, selected_pin = None, None
+
     else:
-        lat0 = float(dfw_filt["Lat"].mean()); lon0 = float(dfw_filt["Lon"].mean())
+        # Center & map
+       
+        valid = dfw_filt.dropna(subset=["Lat", "Lon"])
+        valid = jitter_duplicates(valid)   # <<< add this line
+
+        lat0 = float(valid["Lat"].mean())
+        lon0 = float(valid["Lon"].mean())
         fmap = folium.Map(location=[lat0, lon0], zoom_start=11, tiles="cartodbpositron")
 
-        for _, row in dfw_filt.dropna(subset=["Lat","Lon"]).iterrows():
-            comm = str(row["Community"]); pin = str(row["Pincode"]); city = str(row.get("City",""))
+        # Cluster all markers (keeps performance while showing everything)
+        cluster = MarkerCluster().add_to(fmap)
+
+        # Prepare arrays
+        comm_arr = valid["Community"].astype(str).to_numpy()
+        pin_arr  = valid["Pincode"].astype(str).to_numpy()
+        lat_arr  = valid["Lat"].astype(float).to_numpy()
+        lon_arr  = valid["Lon"].astype(float).to_numpy()
+        city_arr = valid["City"].astype(str).to_numpy() if "City" in valid else [""]*len(valid)
+
+        # Compute date window once
+        start_dt = pd.to_datetime(start_m + "-01")
+        end_dt   = pd.to_datetime(end_m + "-01")
+
+        # Loop once
+        for comm, pin, lat, lon, city in zip(comm_arr, pin_arr, lat_arr, lon_arr, city_arr):
             stats = summarize_for_community(community_id=comm, pincode=pin)
+
+            # >>> THIS IS THE REPLACED POPUP CONTENT <<<
+            # Use image-based charts (safe for Folium popups)
+            
+            try:
+                bar_img, donut_img = popup_charts_for_comm(dfl_filt, comm)
+            except Exception as e:
+                bar_img, donut_img = "", ""   # fail safe so the map still renders
+
             popup_html = f"""
-            <div style='font-family:Poppins; width:230px; color:{TEXT_DARK};'>
-              <h4 style='margin:0 0 6px 0;color:{BRAND_PRIMARY};'>{comm}</h4>
-              <div style='font-size:12px;'>City: {city} | Pincode: {pin}</div>
-              <hr style='margin:6px 0;'>
-              <div style='font-size:13px;'>
-                <b>Tonnage</b>: {stats['Tonnage_sum']:,.0f}<br>
-                <b>CO₂ Averted (kg)</b>: {stats['CO2_sum']:,.0f}<br>
-                <b>Households</b>: {stats['HH_sum']:,.0f}<br>
-                <b>Segregation % (avg)</b>: {stats['Seg_pct_avg']:.1f}<br>
-                <b>Impact (avg)</b>: {stats['Impact_avg']:.1f}
-              </div>
-              <div style='margin-top:6px;font-size:11px;'>Range: {start_m} → {end_m}</div>
+            <div style='font-family:Poppins; width:360px;'>
+                <h4 style='margin:0 0 4px 0; color:#36204D;'>{comm}</h4>
+                <div style='font-size:12px; color:#333;'>City: {city} | Pincode: {pin}</div>
+                <hr style='margin:6px 0;'>
+
+                <div style='display:flex; align-items:center; margin-bottom:6px;'>
+                    <img src="{TREE_ICON}" width="18">
+                    <span style='margin-left:8px;'><b>{stats['Trees_saved']:,.0f} Trees Saved</b></span>
+                </div>
+                <div style='display:flex; align-items:center; margin-bottom:6px;'>
+                    <img src="{HOUSE_ICON}" width="18">
+                    <span style='margin-left:8px;'><b>{stats['HH_sum']:,.0f} Households Participating</b></span>
+                </div>
+                <div style='display:flex; align-items:center; margin-bottom:6px;'>
+                    <img src="{RECYCLE_ICON}" width="18">
+                    <span style='margin-left:8px;'><b>{stats['Seg_pct_avg']:.1f}% Segregation</b></span>
+                </div>
+
+                <hr style='margin:8px 0;'>
+                <div style='margin-bottom:8px;'>
+                    <b>CO₂ Averted</b>
+                    {donut_img}
+                </div>
+
+                <div style='margin-top:6px;'>
+                    <b>Tonnage</b>
+                    {bar_img}
+                </div>
             </div>
             """
+
+        
             folium.CircleMarker(
-                location=[row["Lat"], row["Lon"]],
+                location=[lat, lon],
                 radius=6,
-                color=BRAND_PRIMARY,       # purple markers
+                color=BRAND_PRIMARY,
                 fill=True,
-                fill_color=BRAND_PRIMARY,  # purple fill
+                fill_color=BRAND_PRIMARY,
                 fill_opacity=0.9,
                 tooltip=folium.Tooltip(f"{comm} • {pin}"),
-                popup=folium.Popup(popup_html, max_width=280),
-            ).add_to(fmap)
+                popup=folium.Popup(popup_html, max_width=420),
+            ).add_to(cluster)
 
+        # Render map
         st.markdown("##### Map")
-        map_event = st_folium(fmap, height=560, use_container_width=True)
+        map_event = st_folium(
+            fmap,
+            height=ST_MAP_HEIGHT,
+            use_container_width=True,
+            returned_objects=ST_RETURNED_OBJECTS  # don't return all markers to Streamlit
+        )
 
-        # Capture selection from tooltip
+        # Capture selection
         selected_comm, selected_pin = None, None
         if map_event and map_event.get("last_object_clicked_tooltip"):
             tip = map_event["last_object_clicked_tooltip"]  # "COMMUNITY • PINCODE"
@@ -364,33 +643,163 @@ with tab_map:
             selected_comm = str(dfw_filt.iloc[0]["Community"])
             selected_pin  = str(dfw_filt.iloc[0]["Pincode"])
 
+
+            
+    # ---------------- Marker Loop Ends Here ----------------
+
+    
+
+
+       
+        
     # ---- Selection & Trends moved BELOW the map ----
-    st.markdown("---")
-    st.markdown("### Selection & Trends")
+    # ---- Selection & Trends BELOW the map ----
+st.markdown("---")
+st.markdown("### Selection & Trends")
 
-    if not has_latlon or selected_comm is None:
-        st.info("Click a marker to see selection details and trends here.")
-    else:
-        row0 = dfw_filt[dfw_filt["Community"] == selected_comm].iloc[0]
-        city = str(row0.get("City",""))
+if not has_latlon or selected_comm is None:
+    st.info("Click a marker to see selection details and trends here.")
+else:
+    # safer match on string type
+    row0 = dfw_filt[dfw_filt["Community"].astype(str) == str(selected_comm)].iloc[0]
+    city = str(row0.get("City", ""))
 
-        st.markdown(
-            f"<h4 style='margin:0;color:{BRAND_PRIMARY};'>{selected_comm}</h4>"
-            f"<div>City: {city} | Pincode: {selected_pin}</div>", unsafe_allow_html=True
+    st.markdown(
+        f"<h4 style='margin:0;color:{BRAND_PRIMARY};'>{selected_comm}</h4>"
+        f"<div>City: {city} | Pincode: {selected_pin}</div>",
+        unsafe_allow_html=True,
+    )
+
+    # --- KPIs (CO2 from formula) ---
+    cA, cB, cC, cD = st.columns(4)
+    stats = summarize_for_community(community_id=selected_comm, pincode=selected_pin)
+    cA.metric("Tonnage (kg)", f"{stats['Tonnage_sum']:,.0f}")
+    cB.metric("CO₂ Averted (kg)", f"{stats['CO2_calc']:,.0f}")  # ← formula-based
+    cC.metric("Households", f"{stats['HH_sum']:,.0f}")
+    cD.metric("Segregation % (avg)", f"{stats['Seg_pct_avg']:.1f}")
+
+    # --- Trends (brand color #36204D) ---
+    st.markdown("#### Trends (Selected Community)")
+
+    # 1) Tonnage over time (now a LINE chart)
+    ton = monthly_series(dfl_filt, selected_comm, "Tonnage")
+    if not ton.empty:
+        fig_ton = px.line(
+            ton, x="Date", y="Value",
+            title="Tonnage over Time",
+            labels={"Value": "Tonnage (kg)", "Date": "Date"},
+            markers=True,
         )
+        fig_ton.update_traces(line=dict(color=BRAND_PRIMARY, width=2),
+                            marker=dict(color=BRAND_PRIMARY))
+        fig_ton.update_layout(
+            font=dict(color="#000"),
+            plot_bgcolor="#FFFFFF",
+            paper_bgcolor="#FFFFFF",
+            margin=dict(l=30, r=20, t=50, b=60),
+            xaxis=dict(
+                title=dict(text="Date", font=dict(color="#000")),
+                tickfont=dict(color="#000"),
+                gridcolor="#EEE",
+                zerolinecolor="#EEE",
+            ),
+            yaxis=dict(
+                title=dict(text="Tonnage (kg)", font=dict(color="#000")),
+                tickfont=dict(color="#000"),
+                gridcolor="#EEE",
+                zerolinecolor="#EEE",
+            ),
+        )
+        st.plotly_chart(fig_ton, use_container_width=True)
+    else:
+        st.info("No tonnage data in this date range for the selected community.")
 
-        cA, cB, cC, cD = st.columns(4)
-        stats = summarize_for_community(community_id=selected_comm, pincode=selected_pin)
-        cA.metric("Tonnage", f"{stats['Tonnage_sum']:,.0f}")
-        cB.metric("CO₂ Averted (kg)", f"{stats['CO2_sum']:,.0f}")
-        cC.metric("Households", f"{stats['HH_sum']:,.0f}")
-        cD.metric("Segregation % (avg)", f"{stats['Seg_pct_avg']:.1f}")
+    # 2) CO₂ Averted over time (calculated from dry waste / tonnage)
+    dry_candidates = ["Tonnage_Dry", "Dry_Tonnage", "DryWaste", "Tonnage"]
+    dry = None
+    for m in dry_candidates:
+        s = monthly_series(dfl_filt, selected_comm, m)
+        if not s.empty:
+            dry = s
+            break
 
-        st.markdown("#### Trends")
-        for metric in ["Tonnage", "CO2_Kgs_Averted", "Segregation_Compliance_Pct"]:
-            fig = small_trend(dfl_filt, selected_comm, metric)
-            if fig:
-                st.plotly_chart(fig, use_container_width=True)
+    if dry is not None and not dry.empty:
+        co2 = dry.copy()
+        # If your source unit is tonnes (not kg), uncomment next line:
+        # co2["Value"] = co2["Value"] * 1000.0
+        co2["CO2_kg"] = (co2["Value"] * CO2_PER_KG_DRY).clip(lower=0.0)
+
+        fig_co2 = px.line(
+            co2, x="Date", y="CO2_kg",
+            markers=True,
+            title="CO₂ Averted (Calculated) over Time",
+            labels={"CO2_kg": "CO₂ Averted (kg)", "Date": "Date"},
+        )
+        fig_co2.update_traces(
+            line=dict(color=BRAND_PRIMARY, width=2),
+            marker=dict(color=BRAND_PRIMARY, size=6)
+        )
+        fig_co2.update_layout(
+            font=dict(color="#000"),
+            plot_bgcolor="#FFFFFF",
+            paper_bgcolor="#FFFFFF",
+            margin=dict(l=30, r=20, t=50, b=60),
+            xaxis=dict(
+                title=dict(text="Date", font=dict(color="#000")),
+                tickfont=dict(color="#000"),
+                gridcolor="#EEE",
+                zerolinecolor="#EEE",
+            ),
+            yaxis=dict(
+                title=dict(text="CO₂ Averted (kg)", font=dict(color="#000")),
+                tickfont=dict(color="#000"),
+                gridcolor="#EEE",
+                zerolinecolor="#EEE",
+            ),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_co2, use_container_width=True)
+    else:
+        st.info("No dry/tonnage series available to compute CO₂ for this community.")
+
+        
+
+    
+    # 3) (Optional) Segregation % over time
+    seg = monthly_series(dfl_filt, selected_comm, "Segregation_Compliance_Pct")
+    if not seg.empty:
+        fig_seg = px.line(
+            seg, x="Date", y="Value",
+            markers=True,
+            title="Segregation % over Time",
+            labels={"Value": "Segregation (%)", "Date": "Date"},
+        )
+        fig_seg.update_traces(
+            line=dict(color=BRAND_PRIMARY, width=2),
+            marker=dict(color=BRAND_PRIMARY, size=6)
+        )
+        fig_seg.update_layout(
+            font=dict(color="#000"),
+            plot_bgcolor="#FFFFFF",
+            paper_bgcolor="#FFFFFF",
+            margin=dict(l=30, r=20, t=50, b=60),
+            xaxis=dict(
+                title=dict(text="Date", font=dict(color="#000")),
+                tickfont=dict(color="#000"),
+                gridcolor="#EEE",
+                zerolinecolor="#EEE",
+            ),
+            yaxis=dict(
+                title=dict(text="Segregation (%)", font=dict(color="#000")),
+                tickfont=dict(color="#000"),
+                gridcolor="#EEE",
+                zerolinecolor="#EEE",
+            ),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_seg, use_container_width=True)
+
+
 
 # ---------------- Insights Tab ----------------
 with tab_insights:
